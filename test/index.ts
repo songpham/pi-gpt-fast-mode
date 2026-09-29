@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import fastModeExtension, {
   CONFIG_FIELD,
   DEFAULT_SHORTCUT,
@@ -46,13 +46,18 @@ function createMockPi() {
 
 function createCtx(model = { provider: TARGET_PROVIDER, id: TARGET_MODEL }) {
   const notifications: Array<{ message: string; level: string }> = [];
+  const statuses = new Map<string, string | undefined>();
 
   return {
     model,
     notifications,
+    statuses,
     ui: {
       notify(message: string, level = "info") {
         notifications.push({ message, level });
+      },
+      setStatus(key: string, text: string | undefined) {
+        statuses.set(key, text);
       },
     },
   };
@@ -105,24 +110,63 @@ test("normalizes shortcut settings", () => {
 });
 
 test("resolves Pi config file paths from env, XDG, then default", () => {
-  expect(resolvePiFilePath("settings.json", { env: { PI_CODING_AGENT_DIR: "~/pi-env" }, home: "/home/test" })).toBe(
-    "/home/test/pi-env/settings.json",
+  const home = "/home/test";
+  expect(resolvePiFilePath("settings.json", { env: { PI_CODING_AGENT_DIR: "~/pi-env" }, home })).toBe(
+    join(resolve(join(home, "pi-env")), "settings.json"),
   );
-  expect(resolveKeybindingsPath({ env: { PI_CODING_AGENT_DIR: "~/pi-env" }, home: "/home/test" })).toBe(
-    "/home/test/pi-env/keybindings.json",
+  expect(resolveKeybindingsPath({ env: { PI_CODING_AGENT_DIR: "~/pi-env" }, home })).toBe(
+    join(resolve(join(home, "pi-env")), "keybindings.json"),
   );
 
   expect(
     resolveSettingsPath({
       env: { XDG_CONFIG_HOME: "/xdg" },
-      home: "/home/test",
-      exists: (path) => path === "/xdg/pi/agent/settings.json",
+      home,
+      exists: (path) => path === join(resolve("/xdg"), "pi", "agent", "settings.json"),
     }),
-  ).toBe("/xdg/pi/agent/settings.json");
+  ).toBe(join(resolve("/xdg"), "pi", "agent", "settings.json"));
 
-  expect(resolveSettingsPath({ env: {}, home: "/home/test", exists: () => false })).toBe(
-    "/home/test/.pi/agent/settings.json",
+  expect(resolveSettingsPath({ env: {}, home, exists: () => false })).toBe(
+    join(home, ".pi", "agent", "settings.json"),
   );
+});
+
+test("shows Fast status for supported models and clears it for unsupported models", async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-gpt-fast-status-"));
+
+  try {
+    const agentDir = join(tempDir, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ [CONFIG_FIELD]: { enabled: false } }), "utf8");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    delete process.env.XDG_CONFIG_HOME;
+
+    const pi = createMockPi();
+    fastModeExtension(pi as unknown as Parameters<typeof fastModeExtension>[0]);
+    const sessionStart = pi.handlers.get("session_start")!;
+    const modelSelect = pi.handlers.get("model_select");
+    expect(modelSelect).toBeDefined();
+    if (!modelSelect) return;
+
+    const ctx = createCtx();
+    await sessionStart({}, ctx);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: NORMAL");
+
+    await pi.commands.get("fast")!.handler("", ctx);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
+
+    const unsupportedCtx = createCtx({ provider: "anthropic", id: "claude-opus-4-8" });
+    modelSelect({ model: unsupportedCtx.model }, unsupportedCtx);
+    expect(unsupportedCtx.statuses.get(CONFIG_FIELD)).toBeUndefined();
+
+    modelSelect({ model: ctx.model }, ctx);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
+
+    await pi.commands.get("fast")!.handler("", ctx);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: NORMAL");
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("loads configured shortcuts and toggles payload patching", async () => {
@@ -170,6 +214,7 @@ test("loads configured shortcuts and toggles payload patching", async () => {
     expect(payloadHook({ payload: { model: TARGET_MODEL } }, ctx)).toBeUndefined();
 
     sessionStart({}, ctx);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
     expect(payloadHook({ payload: { model: TARGET_MODEL, store: false } }, ctx)).toEqual({
       model: TARGET_MODEL,
       store: false,
@@ -178,9 +223,11 @@ test("loads configured shortcuts and toggles payload patching", async () => {
 
     await pi.commands.get("fast")!.handler("", ctx);
     expect(ctx.notifications.at(-1)?.message).toMatch(/disabled/);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: NORMAL");
 
     await pi.commands.get("fast")!.handler("", ctx);
     expect(ctx.notifications.at(-1)?.message).toMatch(/enabled/);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
     expect(payloadHook({ payload: { model: TARGET_MODEL, store: false } }, ctx)).toEqual({
       model: TARGET_MODEL,
       store: false,
@@ -188,6 +235,7 @@ test("loads configured shortcuts and toggles payload patching", async () => {
     });
 
     await pi.commands.get("fast")!.handler("", ctx);
+    expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: NORMAL");
     const unsupportedCtx = createCtx({ provider: "anthropic", id: "claude-opus-4-8" });
     await pi.shortcuts.get("ctrl+alt+m")!.handler(unsupportedCtx);
     expect(payloadHook({ payload: { model: "claude-opus-4-8" } }, unsupportedCtx)).toBeUndefined();

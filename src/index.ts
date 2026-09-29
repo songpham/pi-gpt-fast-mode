@@ -179,7 +179,17 @@ function notify(ctx: unknown, message: string, level: "info" | "warning" | "erro
   ui?.notify?.(message, level);
 }
 
+function setFastModeStatus(ctx: unknown, enabled: boolean, model?: PiModel): void {
+  const context = ctx as
+    | { model?: PiModel; ui?: { setStatus?: (key: string, text: string | undefined) => void } }
+    | undefined;
+  const activeModel = model ?? context?.model;
+  const status = isSupportedModel(activeModel) ? `GPT Fast: ${enabled ? "FAST" : "NORMAL"}` : undefined;
+  context?.ui?.setStatus?.(CONFIG_FIELD, status);
+}
+
 function announceState(ctx: unknown, enabled: boolean): void {
+  setFastModeStatus(ctx, enabled);
   if (!enabled) {
     notify(ctx, "GPT Fast mode disabled.");
     return;
@@ -217,8 +227,13 @@ export default function fastModeExtension(pi: ExtensionAPI): void {
     });
   }
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
     enabled = loadDefaultEnabled();
+    setFastModeStatus(ctx, enabled);
+  });
+
+  pi.on("model_select", (event, ctx) => {
+    setFastModeStatus(ctx, enabled, event.model);
   });
 
   pi.on("before_provider_request", (event, ctx) => {
