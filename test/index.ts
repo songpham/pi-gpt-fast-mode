@@ -35,7 +35,7 @@ type TestStreams = {
 type TestStreamHandler = (
   model: TestModel,
   context: unknown,
-  options?: { reasoning?: "high" },
+  options?: { reasoning?: "high"; toolChoice?: "required" },
 ) => unknown;
 type FastModeStreamFactory = (api: TestStreams, enabled: () => boolean) => TestStreamHandler;
 
@@ -136,6 +136,28 @@ test("passes native priority serviceTier for supported Codex and OpenAI models",
     expect(calls[0]?.options).toMatchObject({ serviceTier: "priority", reasoningEffort: "high" });
     expect((calls[0]?.options as Record<string, unknown>)?.service_tier).toBeUndefined();
   }
+});
+
+test("forwards caller stream options on the native fast path", () => {
+  const createStreamHandler = createFastModeStreamSimple as unknown as FastModeStreamFactory;
+  const calls: StreamCall[] = [];
+  const handler = createStreamHandler(createTestStreams(calls), () => true);
+
+  handler(
+    {
+      provider: TARGET_PROVIDER,
+      id: "gpt-5.6-luna",
+      reasoning: true,
+      contextWindow: 200_000,
+      maxTokens: 128_000,
+    },
+    { messages: [] },
+    { reasoning: "high", toolChoice: "required" },
+  );
+
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.kind).toBe("native");
+  expect(calls[0]?.options).toMatchObject({ serviceTier: "priority", toolChoice: "required" });
 });
 
 test("Fast OFF and unsupported models delegate without a service tier", () => {

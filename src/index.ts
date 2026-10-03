@@ -1,11 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { clampThinkingLevel } from "@earendil-works/pi-ai";
-import type { OpenAICodexResponsesOptions, OpenAIResponsesOptions } from "@earendil-works/pi-ai";
-import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
-import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import { clampThinkingLevel, openAICodexResponsesApi, openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import type { OpenAICodexResponsesOptions, OpenAIResponsesOptions } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Pi's model metadata has no service-tier capability yet. Keep this explicit compatibility
@@ -62,11 +59,10 @@ export function createFastModeStreamSimple(
       return api.streamSimple(model, context, options);
     }
 
-    const baseOptions = buildBaseOptions(model, context, options, options?.apiKey);
     const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
     const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
     const nativeOptions: OpenAICodexResponsesOptions | OpenAIResponsesOptions = {
-      ...baseOptions,
+      ...options,
       ...(reasoningEffort ? { reasoningEffort } : {}),
       serviceTier: FAST_SERVICE_TIER,
     };
