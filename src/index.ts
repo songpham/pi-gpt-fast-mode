@@ -12,13 +12,15 @@ export const SUPPORTED_MODELS = new Set([
   "openai/gpt-5.4-mini",
   "openai/gpt-5.5",
   "openai/gpt-5.6-luna",
+  "openai/gpt-6-luna",
   "openai-codex/gpt-5.4",
   "openai-codex/gpt-5.4-mini",
   "openai-codex/gpt-5.5",
   "openai-codex/gpt-5.6-luna",
+  "openai-codex/gpt-6-luna",
 ]);
 export const TARGET_PROVIDER = "openai-codex";
-export const TARGET_MODEL = "gpt-5.6-luna";
+export const TARGET_MODEL = "gpt-6-luna";
 export const FAST_SERVICE_TIER = "priority";
 export const CONFIG_FIELD = "pi-gpt-fast-mode";
 export const KEYBINDING_FIELD = CONFIG_FIELD;
