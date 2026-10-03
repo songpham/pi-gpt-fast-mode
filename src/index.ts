@@ -1,32 +1,27 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { clampThinkingLevel } from "@earendil-works/pi-ai";
+import type { OpenAICodexResponsesOptions, OpenAIResponsesOptions } from "@earendil-works/pi-ai";
+import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
+import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+// Pi's model metadata has no service-tier capability yet. Keep this explicit compatibility
+// fallback narrow; do not infer Priority support from GPT model names or prefixes.
 export const SUPPORTED_MODELS = new Set([
   "openai/gpt-5.4",
   "openai/gpt-5.4-mini",
   "openai/gpt-5.5",
-  "openai/gpt-5.6",
-  "openai/gpt-5.6-sol",
-  "openai/gpt-5.6-terra",
   "openai/gpt-5.6-luna",
-  "openai/gpt-6",
-  "openai/gpt-6-sol",
-  "openai/gpt-6-luna",
   "openai-codex/gpt-5.4",
   "openai-codex/gpt-5.4-mini",
   "openai-codex/gpt-5.5",
-  "openai-codex/gpt-5.6",
-  "openai-codex/gpt-5.6-sol",
-  "openai-codex/gpt-5.6-terra",
   "openai-codex/gpt-5.6-luna",
-  "openai-codex/gpt-6",
-  "openai-codex/gpt-6-sol",
-  "openai-codex/gpt-6-luna",
 ]);
 export const TARGET_PROVIDER = "openai-codex";
-export const TARGET_MODEL = "gpt-6";
+export const TARGET_MODEL = "gpt-5.6-luna";
 export const FAST_SERVICE_TIER = "priority";
 export const CONFIG_FIELD = "pi-gpt-fast-mode";
 export const KEYBINDING_FIELD = CONFIG_FIELD;
@@ -34,7 +29,6 @@ export const DEFAULT_SHORTCUT = "ctrl+alt+m";
 export const RESERVED_SHORTCUTS = new Set(["ctrl+m", "enter", "return"]);
 
 type PiModel = { provider?: string; id?: string };
-type ProviderPayload = Record<string, unknown>;
 type PiConfig = Record<string, unknown>;
 type ReadTextFile = (path: string, encoding: "utf8") => string;
 
@@ -45,10 +39,7 @@ type PiFileLoadOptions = {
   readFile?: ReadTextFile;
 };
 
-/**
- * True when this request is for a supported GPT model this extension knows how to speed up.
- * The payload check makes tests and future provider edge-cases less dependent on ctx.model.
- */
+/** Return the exact provider/model key used by the explicit Fast-mode fallback allowlist. */
 export function modelKey(model: PiModel): string {
   return `${model.provider}/${model.id}`;
 }
@@ -58,18 +49,29 @@ export function isSupportedModel(model: PiModel | undefined): boolean {
   return SUPPORTED_MODELS.has(modelKey(model));
 }
 
-export function shouldApplyFastMode(model: PiModel | undefined, payload: unknown): boolean {
-  if (!payload || typeof payload !== "object") return false;
-  const requestModel = (payload as ProviderPayload).model;
-  return isSupportedModel(model) && requestModel === model?.id;
-}
+type NativeResponsesApi = ReturnType<typeof openAICodexResponsesApi>;
+type NativeStreamSimple = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["streamSimple"]>;
 
-/** Return a patched provider payload that asks Codex for the Fast service tier. */
-export function withFastServiceTier(payload: unknown): unknown {
-  if (!payload || typeof payload !== "object") return payload;
-  return {
-    ...(payload as ProviderPayload),
-    service_tier: FAST_SERVICE_TIER,
+/** Wrap Pi's native responses API so its service-tier option also reaches local usage accounting. */
+export function createFastModeStreamSimple(
+  api: NativeResponsesApi,
+  isFastEnabled: () => boolean,
+): NativeStreamSimple {
+  return (model, context, options) => {
+    if (!isFastEnabled() || !isSupportedModel(model)) {
+      return api.streamSimple(model, context, options);
+    }
+
+    const baseOptions = buildBaseOptions(model, context, options, options?.apiKey);
+    const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+    const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+    const nativeOptions: OpenAICodexResponsesOptions | OpenAIResponsesOptions = {
+      ...baseOptions,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      serviceTier: FAST_SERVICE_TIER,
+    };
+
+    return api.stream(model, context, nativeOptions);
   };
 }
 
@@ -211,10 +213,37 @@ export default function fastModeExtension(pi: ExtensionAPI): void {
     announceState(ctx, enabled);
   }
 
+  pi.registerProvider(TARGET_PROVIDER, {
+    api: "openai-codex-responses",
+    streamSimple: createFastModeStreamSimple(openAICodexResponsesApi(), () => enabled),
+  });
+  pi.registerProvider("openai", {
+    api: "openai-responses",
+    streamSimple: createFastModeStreamSimple(openAIResponsesApi(), () => enabled),
+  });
+
   pi.registerCommand("fast", {
-    description: "Toggle GPT Fast mode (service_tier: priority)",
-    handler: async (_args, ctx) => {
-      await toggle(ctx);
+    description: "Toggle or set GPT Fast mode (service tier: priority)",
+    handler: async (args, ctx) => {
+      switch (args.trim().toLowerCase()) {
+        case "":
+          await toggle(ctx);
+          break;
+        case "on":
+          enabled = true;
+          announceState(ctx, enabled);
+          break;
+        case "off":
+          enabled = false;
+          announceState(ctx, enabled);
+          break;
+        case "status":
+          setFastModeStatus(ctx, enabled);
+          notify(ctx, `GPT Fast mode is ${enabled ? "enabled" : "disabled"}.`);
+          break;
+        default:
+          notify(ctx, "Usage: /fast [on|off|status]", "warning");
+      }
     },
   });
 
@@ -236,9 +265,4 @@ export default function fastModeExtension(pi: ExtensionAPI): void {
     setFastModeStatus(ctx, enabled, event.model);
   });
 
-  pi.on("before_provider_request", (event, ctx) => {
-    if (!enabled) return undefined;
-    if (!shouldApplyFastMode(ctx.model, event.payload)) return undefined;
-    return withFastServiceTier(event.payload);
-  });
 }

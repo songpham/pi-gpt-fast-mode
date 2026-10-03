@@ -1,6 +1,6 @@
 # @tunnckocore/pi-gpt-fast-mode
 
-Fast mode for supported GPT-5.4 / GPT-5.5 / GPT-5.6 / GPT-6 models in Pi - one file, easy to review. No ceremony.
+Fast mode for an explicit set of OpenAI and Codex models in Pi - one file, easy to review.
 
 This package adds one command:
 
@@ -17,7 +17,7 @@ Default is off. As it should be.
 
 Pi already lets you lower reasoning with things like `:low`. That is not the same thing as Codex CLI Fast mode.
 
-Codex Fast mode is a service tier. This extension patches the provider payload before the request leaves Pi:
+Fast mode is a service tier, separate from reasoning effort. This extension passes `serviceTier: "priority"` through Pi's native Responses API option. Pi builds the request field and uses the tier for local usage-cost accounting:
 
 ```json
 {
@@ -25,29 +25,19 @@ Codex Fast mode is a service tier. This extension patches the provider payload b
 }
 ```
 
+The extension delegates to Pi's existing OpenAI and Codex provider implementations; it does not replace their request logic.
+
 It only applies when the active model is one of:
 
 ```text
 openai/gpt-5.4
 openai/gpt-5.4-mini
 openai/gpt-5.5
-openai/gpt-5.6
-openai/gpt-5.6-sol
-openai/gpt-5.6-terra
 openai/gpt-5.6-luna
-openai/gpt-6
-openai/gpt-6-sol
-openai/gpt-6-luna
 openai-codex/gpt-5.4
 openai-codex/gpt-5.4-mini
 openai-codex/gpt-5.5
-openai-codex/gpt-5.6
-openai-codex/gpt-5.6-sol
-openai-codex/gpt-5.6-terra
 openai-codex/gpt-5.6-luna
-openai-codex/gpt-6
-openai-codex/gpt-6-sol
-openai-codex/gpt-6-luna
 ```
 
 Other models are left alone. No weird surprise bill multiplier on a random provider.
@@ -80,16 +70,12 @@ pi install npm:@tunnckocore/pi-gpt-fast-mode
 
 ## Use
 
-Inside Pi:
+Inside Pi, `/fast` toggles the mode. Explicit commands are also available:
 
 ```text
-/fast
-```
-
-Toggle it off the same way:
-
-```text
-/fast
+/fast on
+/fast off
+/fast status
 ```
 
 When a supported model is selected, Pi's footer shows `GPT Fast: FAST` when priority mode is enabled and `GPT Fast: NORMAL` when it is disabled. The status is hidden for unsupported models.
@@ -160,11 +146,7 @@ If `XDG_CONFIG_HOME` is unset, it tries `~/.config` for the XDG paths.
 
 ## Caveats
 
-This is a payload patch, not first-class Pi core support.
-
-So yes: it asks Codex for the Fast service tier. But Pi's own pricing display may not perfectly explain the increased usage if the upstream response does not report the tier back clearly.
-
-The request is the part that matters.
+Pi does not currently expose service-tier capability in model metadata, so the extension uses a small explicit compatibility allowlist rather than inferring support from GPT names. `gpt-5.6-luna` is included for `openai-codex`. Update the fallback list as Pi adds capability metadata.
 
 ## Test
 
@@ -172,13 +154,4 @@ The request is the part that matters.
 bun run test
 ```
 
-The test mocks the Pi extension API and checks the only things worth checking here:
-
-- default is off
-- `/fast` turns it on
-- `/fast` turns it off
-- only supported GPT-5.4 / GPT-5.5 / GPT-5.6 / GPT-6 models get patched
-- footer status tracks Fast mode and supported model selection
-- keybinding config is loaded
-
-No fake testing theater. Just enough net under the wire.
+The tests check native service-tier routing, Fast OFF and unsupported-model behavior, `/fast` command behavior, footer status, and keybinding configuration.

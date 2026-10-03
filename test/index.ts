@@ -3,9 +3,9 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import fastModeExtension, {
+  createFastModeStreamSimple,
   CONFIG_FIELD,
   DEFAULT_SHORTCUT,
-  FAST_SERVICE_TIER,
   KEYBINDING_FIELD,
   RESERVED_SHORTCUTS,
   SUPPORTED_MODELS,
@@ -17,21 +17,52 @@ import fastModeExtension, {
   resolveKeybindingsPath,
   resolvePiFilePath,
   resolveSettingsPath,
-  shouldApplyFastMode,
-  withFastServiceTier,
 } from "../src/index.ts";
 
 type MockCtx = ReturnType<typeof createCtx>;
+type TestModel = {
+  provider: string;
+  id: string;
+  reasoning: boolean;
+  contextWindow: number;
+  maxTokens: number;
+};
+type StreamCall = { kind: "native" | "simple"; options?: unknown };
+type TestStreams = {
+  stream: (_model: unknown, _context: unknown, options?: unknown) => unknown;
+  streamSimple: (_model: unknown, _context: unknown, options?: unknown) => unknown;
+};
+type TestStreamHandler = (
+  model: TestModel,
+  context: unknown,
+  options?: { reasoning?: "high" },
+) => unknown;
+type FastModeStreamFactory = (api: TestStreams, enabled: () => boolean) => TestStreamHandler;
+
+function createTestStreams(calls: StreamCall[]): TestStreams {
+  return {
+    stream: (_model, _context, options) => {
+      calls.push({ kind: "native", options });
+      return "native stream";
+    },
+    streamSimple: (_model, _context, options) => {
+      calls.push({ kind: "simple", options });
+      return "simple stream";
+    },
+  };
+}
 
 function createMockPi() {
   const commands = new Map<string, { handler: (args: string, ctx: MockCtx) => Promise<void> | void }>();
   const shortcuts = new Map<string, { handler: (ctx: MockCtx) => Promise<void> | void }>();
   const handlers = new Map<string, (event: any, ctx: MockCtx) => unknown>();
+  const providers = new Map<string, { api?: string; streamSimple?: (...args: any[]) => unknown }>();
 
   return {
     commands,
     shortcuts,
     handlers,
+    providers,
     registerCommand(name: string, options: { handler: (args: string, ctx: MockCtx) => Promise<void> | void }) {
       commands.set(name, options);
     },
@@ -40,6 +71,9 @@ function createMockPi() {
     },
     on(event: string, handler: (event: any, ctx: MockCtx) => unknown) {
       handlers.set(event, handler);
+    },
+    registerProvider(name: string, config: { api?: string; streamSimple?: (...args: any[]) => unknown }) {
+      providers.set(name, config);
     },
   };
 }
@@ -79,20 +113,66 @@ afterEach(() => {
   else process.env.XDG_CONFIG_HOME = previousXdg;
 });
 
-test("patches only supported GPT payloads", () => {
-  for (const key of SUPPORTED_MODELS) {
-    const [provider, id] = key.split("/");
-    expect(shouldApplyFastMode({ provider, id }, { model: id })).toBe(true);
+test("passes native priority serviceTier for supported Codex and OpenAI models", () => {
+  const createStreamHandler = createFastModeStreamSimple as unknown as FastModeStreamFactory;
+  const context = { messages: [] };
+
+  for (const model of [
+    {
+      provider: "openai-codex",
+      id: "gpt-5.6-luna",
+      reasoning: true,
+      contextWindow: 200_000,
+      maxTokens: 128_000,
+    },
+    { provider: "openai", id: "gpt-5.5", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  ]) {
+    const calls: StreamCall[] = [];
+    const handler = createStreamHandler(createTestStreams(calls), () => true);
+
+    expect(handler(model, context, { reasoning: "high" })).toBe("native stream");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind).toBe("native");
+    expect(calls[0]?.options).toMatchObject({ serviceTier: "priority", reasoningEffort: "high" });
+    expect((calls[0]?.options as Record<string, unknown>)?.service_tier).toBeUndefined();
+  }
+});
+
+test("Fast OFF and unsupported models delegate without a service tier", () => {
+  const createStreamHandler = createFastModeStreamSimple as unknown as FastModeStreamFactory;
+  const context = { messages: [] };
+
+  for (const [model, enabled] of [
+    [
+      {
+        provider: TARGET_PROVIDER,
+        id: "gpt-5.6-luna",
+        reasoning: true,
+        contextWindow: 200_000,
+        maxTokens: 128_000,
+      },
+      false,
+    ],
+    [
+      {
+        provider: TARGET_PROVIDER,
+        id: "gpt-5.6-mars",
+        reasoning: true,
+        contextWindow: 200_000,
+        maxTokens: 128_000,
+      },
+      true,
+    ],
+  ] as const) {
+    const calls: StreamCall[] = [];
+    const handler = createStreamHandler(createTestStreams(calls), () => enabled);
+
+    expect(handler(model, context)).toBe("simple stream");
+    expect(calls).toEqual([{ kind: "simple", options: undefined }]);
   }
 
-  expect(shouldApplyFastMode({ provider: "openai", id: "gpt-5.4-nano" }, { model: "gpt-5.4-nano" })).toBe(false);
-  expect(shouldApplyFastMode({ provider: "openai", id: "gpt-5.6-mars" }, { model: "gpt-5.6-mars" })).toBe(false);
-  expect(shouldApplyFastMode({ provider: TARGET_PROVIDER, id: "gpt-5.6-sol" }, { model: TARGET_MODEL })).toBe(false);
-  expect(withFastServiceTier({ model: TARGET_MODEL, input: [] })).toEqual({
-    model: TARGET_MODEL,
-    input: [],
-    service_tier: FAST_SERVICE_TIER,
-  });
+  expect(SUPPORTED_MODELS.has("openai-codex/gpt-5.6-luna")).toBe(true);
+  expect(SUPPORTED_MODELS.has("openai-codex/gpt-5.6-mars")).toBe(false);
 });
 
 test("normalizes shortcut settings", () => {
@@ -169,7 +249,26 @@ test("shows Fast status for supported models and clears it for unsupported model
   }
 });
 
-test("loads configured shortcuts and toggles payload patching", async () => {
+test("/fast on, off, and status preserve explicit command behavior", async () => {
+  const pi = createMockPi();
+  fastModeExtension(pi as unknown as Parameters<typeof fastModeExtension>[0]);
+  const ctx = createCtx();
+  const command = pi.commands.get("fast")!;
+
+  await command.handler("on", ctx);
+  expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
+  expect(ctx.notifications.at(-1)?.message).toMatch(/enabled/);
+
+  await command.handler("status", ctx);
+  expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
+  expect(ctx.notifications.at(-1)?.message).toMatch(/enabled/);
+
+  await command.handler("off", ctx);
+  expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: NORMAL");
+  expect(ctx.notifications.at(-1)?.message).toMatch(/disabled/);
+});
+
+test("loads shortcuts and registers native service-tier providers", async () => {
   const tempDir = mkdtempSync(join(tmpdir(), "pi-gpt-fast-mode-"));
 
   try {
@@ -196,30 +295,20 @@ test("loads configured shortcuts and toggles payload patching", async () => {
 
     expect(pi.commands.has("fast")).toBe(true);
     expect(pi.shortcuts.has("ctrl+alt+m")).toBe(true);
-    expect(pi.handlers.has("before_provider_request")).toBe(true);
+    expect(pi.handlers.has("before_provider_request")).toBe(false);
     expect(pi.handlers.has("session_start")).toBe(true);
+    expect(pi.providers.get("openai-codex")?.api).toBe("openai-codex-responses");
+    expect(pi.providers.get("openai")?.api).toBe("openai-responses");
+    expect(typeof pi.providers.get("openai-codex")?.streamSimple).toBe("function");
 
     const ctx = createCtx();
-    const payloadHook = pi.handlers.get("before_provider_request")!;
     const sessionStart = pi.handlers.get("session_start")!;
-
-    expect(payloadHook({ payload: { model: TARGET_MODEL, store: false } }, ctx)).toEqual({
-      model: TARGET_MODEL,
-      store: false,
-      service_tier: FAST_SERVICE_TIER,
-    });
 
     await pi.commands.get("fast")!.handler("", ctx);
     expect(ctx.notifications.at(-1)?.message).toMatch(/disabled/);
-    expect(payloadHook({ payload: { model: TARGET_MODEL } }, ctx)).toBeUndefined();
 
     sessionStart({}, ctx);
     expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
-    expect(payloadHook({ payload: { model: TARGET_MODEL, store: false } }, ctx)).toEqual({
-      model: TARGET_MODEL,
-      store: false,
-      service_tier: FAST_SERVICE_TIER,
-    });
 
     await pi.commands.get("fast")!.handler("", ctx);
     expect(ctx.notifications.at(-1)?.message).toMatch(/disabled/);
@@ -228,17 +317,11 @@ test("loads configured shortcuts and toggles payload patching", async () => {
     await pi.commands.get("fast")!.handler("", ctx);
     expect(ctx.notifications.at(-1)?.message).toMatch(/enabled/);
     expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: FAST");
-    expect(payloadHook({ payload: { model: TARGET_MODEL, store: false } }, ctx)).toEqual({
-      model: TARGET_MODEL,
-      store: false,
-      service_tier: FAST_SERVICE_TIER,
-    });
 
     await pi.commands.get("fast")!.handler("", ctx);
     expect(ctx.statuses.get(CONFIG_FIELD)).toBe("GPT Fast: NORMAL");
     const unsupportedCtx = createCtx({ provider: "anthropic", id: "claude-opus-4-8" });
     await pi.shortcuts.get("ctrl+alt+m")!.handler(unsupportedCtx);
-    expect(payloadHook({ payload: { model: "claude-opus-4-8" } }, unsupportedCtx)).toBeUndefined();
     expect(unsupportedCtx.notifications.at(-1)?.level).toBe("warning");
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
